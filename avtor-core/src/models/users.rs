@@ -9,9 +9,11 @@ use std::{
     future::Future,
     hash::Hash,
 };
-use tokio_postgres::{Client, Row};
+use tokio_postgres::{Client, Row, Transaction};
 use uuid::Uuid;
 use validator::{Validate, ValidationError, ValidationErrors};
+
+use super::common::field_names_without_id;
 
 #[derive(Debug, Clone, Copy, Deserialize, postgres_derive::ToSql, FromSql, Default)]
 pub struct UserId(Uuid);
@@ -41,20 +43,20 @@ entity! {
 pub fn map_from_result(result: Result<Row, tokio_postgres::Error>) -> User {
     match result {
         Ok(u) => User::from_row(u),
-        Err(_) => User::default()
+        Err(_) => User::default(),
     }
 }
 
 #[derive(Debug, Validate, Deserialize, Clone)]
 pub struct UserDto {
-    id: Uuid,
+    pub id: Uuid,
     #[validate(length(min = 3, message = "username_required"))]
-    username: String,
+    pub username: String,
     #[validate(length(min = 8, max = 18, message = "password_between_8_and_18_chars"))]
-    password: String,
+    pub password: String,
     #[validate(length(min = 1, message = "roles_required"))]
-    roles: String,
-    account_id: Uuid,
+    pub roles: String,
+    pub account_id: Uuid,
 }
 
 pub fn user_from_dto(dto: UserDto) -> User {
@@ -187,29 +189,21 @@ pub fn user_table() -> String {
 }
 
 pub fn find_super_user<'a>(
-    client: &'a Client,
+    client: &'a Transaction,
 ) -> impl FnOnce() -> BoxFuture<'a, Result<Option<User>, CreateSuperUserError>> {
     move || {
         Box::pin(async move {
             let rol_crit = UserCriteria::RolesLike("%super_admin%".to_string());
             let crit = vec![rol_crit.to_query_condition()];
             select(client, &user_table(), &crit, User::from_row)
-                .await 
+                .await
                 .map_err(|_| CreateSuperUserError::RepoError("".to_string()))
         })
     }
 }
 
-pub fn field_names_without_id(fields: &[&str]) -> Vec<String> {
-    fields
-        .iter()
-        .map(|x| x.to_string())
-        .filter(|x| x != &"id".to_string())
-        .collect()
-}
-
 pub fn insert_user<'a>(
-    client: &'a Client,
+    client: &'a Transaction,
 ) -> impl FnOnce(User) -> BoxFuture<'a, Result<(), CreateSuperUserError>> {
     move |user: User| {
         Box::pin(async move {
@@ -288,23 +282,27 @@ where
             match maybe_existing_account {
                 Some(_) => Err(CreateSuperUserError::AccountExists),
                 None => {
-                    let account = Account { id: AccountId(account_dto.id), name: account_dto.clone().name };
-                    let _ = insert_account(account).await.map_err(|e| CreateSuperUserError::RepoError(e.to_string()))?;
+                    let account = Account {
+                        id: AccountId(account_dto.id),
+                        name: account_dto.clone().name,
+                    };
+                    let _ = insert_account(account)
+                        .await
+                        .map_err(|e| CreateSuperUserError::RepoError(e.to_string()))?;
                     let ins_res = insert(user).await;
                     match ins_res {
                         Ok(_) => Ok(()),
-                        Err(e) => Err(e)
+                        Err(e) => Err(e),
                     }
                 }
-            } 
-        },
+            }
+        }
     }
 }
 
 pub fn account_table() -> String {
     "accounts".to_string()
 }
-
 
 pub enum CreateAccountError {
     RepoError(String),
@@ -313,13 +311,25 @@ pub enum CreateAccountError {
 impl ToString for CreateAccountError {
     fn to_string(&self) -> String {
         match self {
-            Self::RepoError(es) => es.to_owned()
+            Self::RepoError(es) => es.to_owned(),
         }
     }
 }
 
+pub struct Blah<'a> {
+    pub x: &'a dyn FnOnce(String) -> BoxFuture<'a, String>,
+}
+
+fn foo<'a>(x: String) -> BoxFuture<'a, String> {
+    Box::pin(async move { format!("{}!!!", x) })
+}
+
+pub fn blah() {
+    Blah { x: &foo };
+}
+
 pub fn insert_account<'a>(
-    client: &'a Client,
+    client: &'a Transaction,
 ) -> impl FnOnce(Account) -> BoxFuture<'a, Result<(), CreateAccountError>> {
     move |account: Account| {
         Box::pin(async move {
@@ -339,6 +349,20 @@ pub fn insert_account<'a>(
     }
 }
 
+pub fn find_account_by_id<'a>(
+    client: &'a Transaction,
+) -> impl FnOnce(AccountId) -> BoxFuture<'a, Result<Option<Account>, CreateAccountError>> {
+    move |account_id: AccountId| {
+        Box::pin(async move {
+            let id_crit = AccountCriteria::IdEq(account_id);
+            let cond = vec![id_crit.to_query_condition()];
+            select(client, &account_table(), &cond, Account::from_row)
+                .await
+                .map_err(|e| CreateAccountError::RepoError(e.to_string()))
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -348,7 +372,10 @@ mod tests {
 
     use crate::models::users::hash_map_to_string;
 
-    use super::{create_super_user, CreateSuperUserError, User, UserDto, CreateAccountError, Account, AccountDto, AccountId};
+    use super::{
+        create_super_user, Account, AccountDto, AccountId, CreateAccountError,
+        CreateSuperUserError, User, UserDto,
+    };
 
     fn user_dto() -> UserDto {
         UserDto {
@@ -361,8 +388,8 @@ mod tests {
     }
 
     fn account_dto() -> AccountDto {
-        AccountDto { 
-            id: Uuid::from_str("3c3f5220-8b3d-40a3-8da2-196a69beaca8").unwrap(), 
+        AccountDto {
+            id: Uuid::from_str("3c3f5220-8b3d-40a3-8da2-196a69beaca8").unwrap(),
             name: "edb".to_string(),
         }
     }
@@ -385,13 +412,28 @@ mod tests {
         }
     }
 
-
     fn find_account_by_id<'a>(
         count: &'a mut u8,
     ) -> impl FnOnce(AccountId) -> BoxFuture<'a, Result<Option<Account>, CreateAccountError>> {
         move |_: AccountId| {
             *count += 1;
             Box::pin(async move { Ok(None) })
+        }
+    }
+
+    fn fake_account() -> Account {
+        Account {
+            id: AccountId(Uuid::from_str("ac41d7b5-248c-415c-8728-9cb3bd91a6fb").unwrap()),
+            name: "fake".to_string(),
+        }
+    }
+
+    fn find_account_by_id_mock_found<'a>(
+        count: &'a mut u8,
+    ) -> impl FnOnce(AccountId) -> BoxFuture<'a, Result<Option<Account>, CreateAccountError>> {
+        move |_: AccountId| {
+            *count += 1;
+            Box::pin(async move { Ok(Some(fake_account())) })
         }
     }
 
@@ -404,8 +446,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     pub fn test_create_ok() {
         let mut find_existing_super_user_count: u8 = 0;
@@ -416,7 +456,7 @@ mod tests {
         let res = block_on(create_super_user(
             find_existing_super_user(&mut find_existing_super_user_count),
             insert_user_mock(&mut insert_count),
-            insert_account_mock(&mut insert_account_count), 
+            insert_account_mock(&mut insert_account_count),
             find_account_by_id(&mut find_account_by_id_count),
             &user_dto(),
             &account_dto(),
@@ -461,6 +501,59 @@ mod tests {
                     assert_eq!(0, find_account_by_id_count);
                     assert_eq!(0, insert_account_count);
                 }
+                _ => assert!(false, "Incorrect variant found"),
+            },
+        }
+    }
+
+    #[test]
+    pub fn test_create_super_user_fails_with_account_found() {
+        let mut find_su_count: u8 = 0;
+        let mut insert_count: u8 = 0;
+        let mut insert_account_count: u8 = 0;
+        let mut find_account_by_id_count: u8 = 0;
+        let res = block_on(create_super_user(
+            find_existing_super_user(&mut find_su_count),
+            insert_user_mock(&mut insert_count),
+            insert_account_mock(&mut insert_account_count),
+            find_account_by_id_mock_found(&mut find_account_by_id_count),
+            &user_dto(),
+            &account_dto(),
+        ));
+        match res {
+            Ok(_) => assert!(false, "Ok encountered where Err expected"),
+            Err(e) => match e {
+                CreateSuperUserError::AccountExists => {
+                    assert!(true, "Account Exists error encountered")
+                }
+                _ => assert!(false, "Incorrect variant found"),
+            },
+        }
+    }
+
+    #[test]
+    pub fn test_create_super_user_fails_with_account_insert_error() {
+        let mut find_su_count: u8 = 0;
+        let mut insert_count: u8 = 0;
+        let mut insert_account_count: u8 = 0;
+        let mut find_account_by_id_count: u8 = 0;
+
+        let insert_account_error = |_: Account| {
+            insert_account_count += 1;
+            async { Err(CreateAccountError::RepoError("Repo Error".to_string())) }
+        };
+        let res = block_on(create_super_user(
+            find_existing_super_user(&mut find_su_count),
+            insert_user_mock(&mut insert_count),
+            insert_account_error,
+            find_account_by_id(&mut find_account_by_id_count),
+            &user_dto(),
+            &account_dto(),
+        ));
+        match res {
+            Ok(_) => assert!(false, "Ok encountered where Err expected"),
+            Err(e) => match e {
+                CreateSuperUserError::RepoError(e) => assert_eq!("Repo Error".to_string(), e),
                 _ => assert!(false, "Incorrect variant found"),
             },
         }

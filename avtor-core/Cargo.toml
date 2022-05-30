@@ -18,4 +18,4 @@ anyhow = "*"
 futures = "0.3"
 paste = "*"
 validator = { version = "0.12", features = ["derive"] }
-
+async-stripe = { version = "0.14", features = ["runtime-tokio-hyper"] }

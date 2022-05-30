@@ -1,15 +1,20 @@
-use std::io::Error;
+use std::{io::Error, str::FromStr};
 
 use clap::Parser;
-use serde::{Serialize, Deserialize};
-use tokio_postgres::Client;
+use serde::{Deserialize, Serialize};
+use tokio_postgres::{tls::NoTlsStream, Client, Connection, NoTls, Socket};
 
-use avtor_core::models::users::{insert_user, find_super_user, UserDto, create_super_user};
+use avtor_core::models::users::{
+    create_super_user, find_account_by_id, find_super_user, insert_account, insert_user,
+    AccountDto, CreateSuperUserError, UserDto,
+};
+
+pub mod migrations;
+use migrations::migration_01::run_migration_up;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-
     #[clap(long)]
     op: String,
 
@@ -25,11 +30,28 @@ pub struct YamlSuperUser {
     pub password: String,
 }
 
-async fn _create_super_user(client: Client, user_dto: &UserDto) {
-    let this_insert_user = insert_user(&client);
-    let this_find_super_user = find_super_user(&client);
-    let _ = create_super_user(this_find_super_user, this_insert_user, user_dto).await;
-    ()
+async fn _create_super_user(
+    client: &mut Client,
+    user_dto: &UserDto,
+    account_dto: &AccountDto,
+) -> Result<(), CreateSuperUserError> {
+    // todo: map err
+    let trans = client.transaction().await.unwrap();
+    let this_insert_user = insert_user(&trans);
+    let this_find_super_user = find_super_user(&trans);
+    let insert_account_setup = insert_account(&trans);
+    let find_account_by_id_setup = find_account_by_id(&trans);
+    let r = create_super_user(
+        this_find_super_user,
+        this_insert_user,
+        insert_account_setup,
+        find_account_by_id_setup,
+        user_dto,
+        account_dto,
+    )
+    .await;
+    trans.commit().await;
+    r
 }
 
 #[derive(Deserialize, Debug)]
@@ -45,21 +67,56 @@ pub struct EnvConfig {
     pub super_user_password: String,
 }
 
+// todo: move into package
+pub fn conn_str_from_config(config: &EnvConfig) -> String {
+    format!(
+        "postgres://{user}:{password}@{host}:{port}/{db}",
+        user = config.db_user,
+        password = config.db_pass,
+        host = config.db_host,
+        port = config.db_port,
+        db = config.db_name.to_owned().unwrap_or("postgres".to_string()),
+    )
+}
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
+    let env_config = envy::from_env::<EnvConfig>()?;
+    let conn_str = conn_str_from_config(&env_config);
+    let (mut client, conn) = tokio_postgres::connect(&conn_str, NoTls).await?;
     match args.op.as_str() {
         "hello" => Ok(println!("hello")),
-        "create_super_user" => {
-            match args.path {
-                None => Ok(println!("Credentials file path required for {} operation", args.op)),
-                Some(path) => {
-                    let file = std::fs::File::open(path)?; 
-                    let yamlSuperUser: YamlSuperUser = serde_yaml::from_reader(file)?;
-                    Ok(println!("put parsing logic here"))
+        "run_migrations" => {
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    eprintln!("conn error: {}", e);
                 }
-            }
+            });
+            migrations::run_migrations::run_migration_up(&mut client).await
         }
-        _ => Ok(println!("operation {} not recognized", args.op))
-    } 
+        "create_super_user" => match args.path {
+            None => Ok(println!(
+                "Credentials file path required for {} operation",
+                args.op
+            )),
+            Some(path) => {
+                let file = std::fs::File::open(path)?;
+                let yamlSuperUser: YamlSuperUser = serde_yaml::from_reader(file)?;
+                let user_dto = UserDto {
+                    id: uuid::Uuid::new_v4(),
+                    username: env_config.super_user_username,
+                    password: env_config.super_user_password,
+                    roles: "super_user".to_string(),
+                    account_id: uuid::Uuid::from_str(env_config.main_account_id.as_str())?,
+                };
+                let account_dto = AccountDto {
+                    id: uuid::Uuid::from_str(env_config.main_account_id.as_str())?,
+                    name: env_config.main_account_name,
+                };
+                Ok(println!("put parsing logic here"))
+            }
+        },
+        _ => Ok(println!("operation {} not recognized", args.op)),
+    }
 }
